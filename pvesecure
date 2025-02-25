@@ -89,8 +89,8 @@ print_banner() {
     echo "==============================================================="
     echo -e "${NC}"
     echo -e "${GREEN}  Created by: ConnectedSecure${NC}"
-    echo -e "${GREEN}  YouTube: ${NC}https://www.youtube.com/channel/UCSNleiwJs4VC-VYuRJ0nnjg"
-    echo -e "${GREEN}  X/Twitter: ${NC}@SecureCnnected"
+    echo -e "${GREEN}  YouTube: ${NC}https://www.youtube.com/@connectedsecure"
+    echo -e "${GREEN}  X/Twitter: ${NC}@SecureConnected"
     echo ""
 }
 
