@@ -9,7 +9,7 @@
 #  - Discord notifications                                      #
 #                                                               #
 #  Created by: ConnectedSecure                                  #
-#  YouTube: https://www.youtube.com/channel/UCSNleiwJs4VC-VYuRJ0nnjg  #
+#  YouTube: https://www.youtube.com/@connectedsecure		    #
 #  X/Twitter: @SecureCnnected                                   #
 #                                                               #
 #  Version: 2.1                                                 #
@@ -120,6 +120,19 @@ save_config() {
     
     chmod 600 "$CONFIG_FILE"
     echo "Configuration saved to $CONFIG_FILE"
+}
+
+# Function to run commands on the PVE host and log output
+pve_command() {
+    local command="$1"
+    local log_file="$2"
+    
+    # Run the command
+    eval "$command" >> "$log_file" 2>&1
+    local exit_code=$?
+    
+    # Return the exit code
+    return $exit_code
 }
 
 # Function to log and echo output
@@ -470,88 +483,82 @@ run_clamav_in_container() {
         log_and_echo "Container $CTID ($CONTAINER_NAME) scan completed - No infections found" "success"
     fi
 }
-
 # Function to check for rootkits on host
 run_rootkit_check_on_host() {
+    local ROOT_SCAN_LOG="$LOG_DIR/rkhunter_${DATE_TIME}.log"
+    
     log_and_echo "Checking for rootkits on host..." "info"
     
-    # Verify rkhunter is installed
-    if ! command -v rkhunter >/dev/null 2>&1; then
-        log_and_echo "Installing rkhunter..." "info"
-        apt-get update && apt-get install -y rkhunter >> "$DETAILED_LOG" 2>&1
-    fi
-    
-    # Create rootkit scan log file
-    RKH_LOG="${LOG_DIR}/rkhunter_host_${CURRENT_DATE}.log"
-    
-    # Update rkhunter database and run check
+    # Update rkhunter database first
     log_and_echo "Updating rkhunter database..." "info"
-    rkhunter --update >> "$DETAILED_LOG" 2>&1
+    pve_command "rkhunter --update" "$ROOT_SCAN_LOG"
     
+    # Run rootkit scan
     log_and_echo "Running rootkit scan on host..." "info"
-    rkhunter --check --sk >> "$RKH_LOG" 2>&1
+    pve_command "rkhunter --check --sk | tee -a $ROOT_SCAN_LOG" "$ROOT_SCAN_LOG"
     
-    # Check for warnings
-    WARNING_COUNT=$(grep -c "Warning:" "$RKH_LOG" 2>/dev/null || echo "0")
+    # Process the output to count warnings
+    WARNINGS_FOUND=$(grep -c "Warning:" "$ROOT_SCAN_LOG" 2>/dev/null || echo "0")
+    # Clean up the variable to ensure it's just a number
+    WARNINGS_FOUND=$(echo "$WARNINGS_FOUND" | tr -d '\n\r' | grep -o '[0-9]*' || echo "0")
     
-    # Fixed line - replaced the broken conditional with proper syntax
-    if [ "$WARNING_COUNT" -gt 0 ]; then
-        log_and_echo "⚠️ $WARNING_COUNT warnings found in host rootkit scan!" "warning"
-        grep "Warning:" "$RKH_LOG" >> "$SUMMARY_LOG" 2>/dev/null
-    else
-        log_and_echo "Host rootkit scan completed - No warnings found" "success"
+    # Default to 0 if we couldn't parse the result
+    if [[ ! "$WARNINGS_FOUND" =~ ^[0-9]+$ ]]; then
+        WARNINGS_FOUND=0
     fi
     
-    log_and_echo "Full rootkit scan log available at: $RKH_LOG" "info"
+    # Check if any warnings were found
+    if [ $WARNINGS_FOUND -gt 0 ]; then
+        log_and_echo "WARNING: $WARNINGS_FOUND potential rootkit warnings found!" "warning"
+        log_and_echo "Check $ROOT_SCAN_LOG for details" "info"
+        if [ "$SEND_EMAIL" = true ]; then
+            echo "Rootkit scan found $WARNINGS_FOUND warnings. Check $ROOT_SCAN_LOG for details." >> "$EMAIL_CONTENT"
+        fi
+    else
+        log_and_echo "No rootkits found on host" "success"
+        if [ "$SEND_EMAIL" = true ]; then
+            echo "Rootkit scan completed - No issues found." >> "$EMAIL_CONTENT"
+        fi
+    fi
 }
 
-# Function to run rootkit scan in a container
+
+
+
+# Function to check for rootkits in a container
 run_rootkit_check_in_container() {
     local CTID="$1"
-    local CONTAINER_NAME="$2"
+    local CT_NAME="$2"
+    local RK_SCAN_LOG="$LOG_DIR/rkhunter_${CTID}_${DATE_TIME}.log"
     
-    log_and_echo "Checking for rootkits in container $CTID ($CONTAINER_NAME)..." "info"
+    log_and_echo "Checking for rootkits in container $CTID ($CT_NAME)..." "info"
     
-    # Check if we can execute commands in container
-    if ! pct exec "$CTID" -- bash -c "echo 'Container access test'" > /dev/null 2>&1; then
-        log_and_echo "ERROR: Cannot access container $CTID - skipping rootkit scan" "error"
-        return
-    fi
-    
-    # Create rootkit scan log file
-    RKH_LOG="${LOG_DIR}/rkhunter_${CTID}_${CURRENT_DATE}.log"
-    
-    # Check if rkhunter is installed and install if not
-    if ! pct exec "$CTID" -- bash -c 'command -v rkhunter >/dev/null 2>&1'; then
-        log_and_echo "Rkhunter not found in container $CTID, attempting to install..." "info"
-        
-        # Check if we have network connectivity in container
-        if ! pct exec "$CTID" -- bash -c "ping -c 1 8.8.8.8" > /dev/null 2>&1; then
-            log_and_echo "Container $CTID has no network connectivity - skipping rkhunter installation and scan" "warning"
-            return
-        fi
-        
-        # Try to install rkhunter
-        if ! pct exec "$CTID" -- bash -c 'apt-get update && apt-get install -y rkhunter' >> "$DETAILED_LOG" 2>&1; then
-            log_and_echo "Failed to install rkhunter in container $CTID - skipping scan" "error"
-            return
-        fi
-    fi
-    
-    # Run the rkhunter scan
+    # Run rkhunter in the container
     log_and_echo "Running rkhunter scan in container $CTID..." "info"
+    pct exec "$CTID" -- bash -c "if command -v rkhunter >/dev/null 2>&1; then rkhunter --check --sk; else echo 'rkhunter not installed'; fi" > "$RK_SCAN_LOG" 2>&1
     
-    pct exec "$CTID" -- bash -c 'rkhunter --update && rkhunter --check --sk' > "$RKH_LOG" 2>&1
+    # Process the output to count warnings
+    WARNINGS_FOUND=$(grep -c "Warning:" "$RK_SCAN_LOG" 2>/dev/null || echo "0")
+    # Clean up the variable to ensure it's just a number
+    WARNINGS_FOUND=$(echo "$WARNINGS_FOUND" | tr -d '\n\r' | grep -o '[0-9]*' || echo "0")
     
-    # Check for warnings
-    WARNING_COUNT=$(grep -c "Warning:" "$RKH_LOG" 2>/dev/null || echo "0")
+    # Default to 0 if we couldn't parse the result
+    if [[ ! "$WARNINGS_FOUND" =~ ^[0-9]+$ ]]; then
+        WARNINGS_FOUND=0
+    fi
     
-    # Fixed comparison - this is the key fix
-    if [ "$WARNING_COUNT" -gt 0 ]; then
-        log_and_echo "⚠️ $WARNING_COUNT warnings found in container $CTID rootkit scan!" "warning"
-        grep "Warning:" "$RKH_LOG" >> "$SUMMARY_LOG" 2>/dev/null
+    # Check if any warnings were found
+    if [ $WARNINGS_FOUND -gt 0 ]; then
+        log_and_echo "WARNING: $WARNINGS_FOUND potential rootkit warnings found in container $CTID!" "warning"
+        log_and_echo "Check $RK_SCAN_LOG for details" "info"
+        if [ "$SEND_EMAIL" = true ]; then
+            echo "Rootkit scan found $WARNINGS_FOUND warnings in container $CTID ($CT_NAME). Check $RK_SCAN_LOG for details." >> "$EMAIL_CONTENT"
+        fi
     else
         log_and_echo "Container $CTID rootkit scan completed - No warnings found" "success"
+        if [ "$SEND_EMAIL" = true ]; then
+            echo "Rootkit scan in container $CTID ($CT_NAME) completed - No issues found." >> "$EMAIL_CONTENT"
+        fi
     fi
 }
 
