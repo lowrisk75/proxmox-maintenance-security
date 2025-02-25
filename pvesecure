@@ -1,1007 +1,1006 @@
 #!/bin/bash
-# Proxmox Container Security and Maintenance Script
+#################################################################
+#                                                               #
+#  PVESecure - Proxmox VE Security and Maintenance Script       #
+#                                                               #
+#  - Performs system updates                                    #
+#  - Checks container updates                                   #
+#  - Security audits (ClamAV, Rootkit, NPM, Docker)             #
+#  - Discord notifications                                      #
+#                                                               #
+#  Created by: ConnectedSecure                                  #
+#  YouTube: https://www.youtube.com/channel/UCSNleiwJs4VC-VYuRJ0nnjg  #
+#  X/Twitter: @SecureCnnected                                   #
+#                                                               #
+#  Version: 2.1                                                 #
+#                                                               #
+#################################################################
 
-VERSION="2.0"
-DEBUG=false
-TIMEOUT_DURATION=10
-TIMESTAMP=$(date +%Y-%m-%d_%H-%M-%S)
+# Colors for output formatting
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# Log file locations
+# Script version
+SCRIPT_VERSION="2.1"
+
+# Configuration file
+CONFIG_FILE="/etc/pvesecure.conf"
 LOG_DIR="/var/log/proxmox_maintenance"
-LOG_FILE="$LOG_DIR/maintenance_${TIMESTAMP}.log"
-DETAILED_LOG="$LOG_DIR/maintenance_${TIMESTAMP}_detailed.log"
-SUMMARY_FILE="$LOG_DIR/maintenance_${TIMESTAMP}_summary.txt"
-
-# Initialize arrays for container status tracking
-declare -A CONTAINER_STATUS
-declare -A CONTAINER_IPS
-declare -A CONTAINER_PING_TIMES
-declare -A CONTAINER_UPDATES
-declare -A CONTAINER_SCAN_RESULTS
-UPDATED_CONTAINERS=()
-FAILED_CONTAINERS=()
-SKIPPED_CONTAINERS=()
-NETWORK_ISSUES=()
-INFECTED_CONTAINERS=()
-TOTAL_CONTAINERS=0
-CURRENT_CONTAINER=0
+CURRENT_DATE=$(date +%Y-%m-%d_%H-%M-%S)
+DETAILED_LOG="${LOG_DIR}/maintenance_${CURRENT_DATE}_detailed.log"
+SUMMARY_LOG="${LOG_DIR}/maintenance_${CURRENT_DATE}_summary.log"
 
 # Default settings
-VERBOSE=false
-RUN_SECURITY=true
-RUN_VIRUS_SCAN=true
-RUN_UPDATES=true
-MAX_PARALLEL=5
-CURRENT_PARALLEL=0
-AUTO_INSTALL_TOOLS=false
-DISCORD_NOTIFICATION=false
-FULL_MAINTENANCE=false
-CREATE_BACKUPS=false  # Disabled by default
-EMAIL_RECIPIENT=""
-
-# ClamAV configuration
-USE_CLAMD=true
-
-# Color definitions
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-# Create log directory
-mkdir -p "$LOG_DIR"
+DO_UPDATE=false
+DO_SECURITY=false
+DO_BACKUP=false
+EMAIL_NOTIFY=false
+DISCORD_NOTIFY=false
+EMAIL=""
+DISCORD_WEBHOOK=""
 
 # Check if running as root
-check_root() {
-    if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}This script must be run as root${NC}"
-        exit 1
-    fi
-}
-
-# Function to get Discord webhook
-get_discord_webhook() {
-    if [ "$DISCORD_NOTIFICATION" = true ] && [ ! -f "${LOG_DIR}/discord_webhook.txt" ]; then
-        read -p "Enter Discord webhook URL: " webhook
-        echo "$webhook" > "${LOG_DIR}/discord_webhook.txt"
-    fi
-}
-
-# Function to send Discord notifications
-send_discord_notification() {
-    if [ "$DISCORD_NOTIFICATION" = true ] && [ -f "${LOG_DIR}/discord_webhook.txt" ]; then
-        local webhook_url
-        webhook_url=$(cat "${LOG_DIR}/discord_webhook.txt")
-        local message="$1"
-        curl -H "Content-Type: application/json" \
-             -d "{\"content\":\"$message\"}" \
-             "$webhook_url" >/dev/null 2>&1
-    fi
-}
-
-# Logging functions
-log_message() {
-    local timestamp
-    timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    echo "$timestamp : $1" | tee -a "$LOG_FILE"
-    [ "$DISCORD_NOTIFICATION" = true ] && send_discord_notification "$1"
-}
-
-log_detailed() {
-    local timestamp
-    timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    echo "$timestamp : $1" >> "$DETAILED_LOG"
-    if [ "$VERBOSE" = true ]; then
-        echo "$timestamp : $1"
-    fi
-}
-
-log_error() {
-    local timestamp
-    timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    echo -e "${RED}$timestamp : ERROR : $1${NC}" | tee -a "$LOG_FILE" "$DETAILED_LOG"
-    [ "$DISCORD_NOTIFICATION" = true ] && send_discord_notification "ERROR: $1"
-}
-
-log_success() {
-    local timestamp
-    timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    echo -e "${GREEN}$timestamp : SUCCESS : $1${NC}" | tee -a "$LOG_FILE"
-    [ "$DISCORD_NOTIFICATION" = true ] && send_discord_notification "SUCCESS: $1"
-}
-
-log_warning() {
-    local timestamp
-    timestamp=$(date +"%Y-%m-%d %H:%M:%S")
-    echo -e "${YELLOW}$timestamp : WARNING : $1${NC}" | tee -a "$LOG_FILE"
-    [ "$DISCORD_NOTIFICATION" = true ] && send_discord_notification "WARNING: $1"
-}
-
-# Progress display
-progress() {
-    echo -e "\n${BLUE}==> $1${NC}"
-    log_message "$1"
-}
-
-# Email report function
-send_email_report() {
-    if [ -z "$EMAIL_RECIPIENT" ]; then
-        return 0
-    fi
-    
-    local email_body="/tmp/security_email_body.txt"
-    
-    {
-        echo "Proxmox Container Security and Maintenance Report - $(date)"
-        echo "=========================================================="
-        echo ""
-        echo "Summary:"
-        cat "$SUMMARY_FILE"
-        echo ""
-        echo "For detailed information, check logs in $LOG_DIR on the Proxmox host."
-    } > "$email_body"
-    
-    if command -v mail &> /dev/null; then
-        if mail -s "Proxmox Container Security Report - $(date +%F)" "$EMAIL_RECIPIENT" < "$email_body"; then
-            log_success "Email report sent to $EMAIL_RECIPIENT"
-        else
-            log_error "Failed to send email report"
-        fi
-    else
-        log_warning "Mail command not found. Email report not sent. Install with: apt-get install mailutils"
-    fi
-    
-    rm -f "$email_body"
-}
-
-# Interactive setup
-setup_script() {
-    echo -e "\n${BLUE}Proxmox Container Security and Maintenance Script v$VERSION${NC}"
-    echo -e "${BLUE}=======================================================${NC}"
-    echo -e "\n${BLUE}Starting setup...${NC}"
-
-    # --- Maintenance Type Selection ---
-    echo -e "\nSelect maintenance type:"
-    PS3="Enter your choice (number): "
-    options=("Full maintenance (updates, security, virus scan)" 
-             "Basic updates only" 
-             "Security and virus scanning only"
-             "Virus scanning only")
-    select opt in "${options[@]}"
-    do
-        if [[ -n "$opt" ]]; then
-            echo "You selected: $opt"
-            case "$REPLY" in
-                1)
-                    FULL_MAINTENANCE=true
-                    RUN_UPDATES=true
-                    RUN_SECURITY=true
-                    RUN_VIRUS_SCAN=true
-                    ;;
-                2)
-                    FULL_MAINTENANCE=false
-                    RUN_UPDATES=true
-                    RUN_SECURITY=false
-                    RUN_VIRUS_SCAN=false
-                    ;;
-                3)
-                    FULL_MAINTENANCE=false
-                    RUN_UPDATES=false
-                    RUN_SECURITY=true
-                    RUN_VIRUS_SCAN=true
-                    ;;
-                4)
-                    FULL_MAINTENANCE=false
-                    RUN_UPDATES=false
-                    RUN_SECURITY=false
-                    RUN_VIRUS_SCAN=true
-                    ;;
-            esac
-            break
-        else
-            echo "Invalid selection. Please try again."
-        fi
-    done
-
-    # --- Backup Selection ---
-    echo -e "\nCreate backups before making changes?"
-    PS3="Enter your choice (number): "
-    options=("Yes" "No")
-    select opt in "${options[@]}"
-    do
-        if [[ -n "$opt" ]]; then
-            if [ "$REPLY" -eq 1 ]; then
-                CREATE_BACKUPS=true
-            else
-                CREATE_BACKUPS=false
-            fi
-            echo "Create backups: $opt"
-            break
-        else
-            echo "Invalid selection. Please try again."
-        fi
-    done
-
-    # --- Verbose Output Selection ---
-    echo -e "\nSelect verbose output:"
-    PS3="Enter your choice (number): "
-    options=("Yes" "No")
-    select opt in "${options[@]}"
-    do
-        if [[ -n "$opt" ]]; then
-            if [ "$REPLY" -eq 1 ]; then
-                VERBOSE=true
-            else
-                VERBOSE=false
-            fi
-            echo "Verbose output: $opt"
-            break
-        else
-            echo "Invalid selection. Please try again."
-        fi
-    done
-
-    # --- Notification Options ---
-    echo -e "\nSelect notification method:"
-    PS3="Enter your choice (number): "
-    options=("Discord" "Email" "Both" "None")
-    select opt in "${options[@]}"
-    do
-        if [[ -n "$opt" ]]; then
-            case "$REPLY" in
-                1)
-                    DISCORD_NOTIFICATION=true
-                    get_discord_webhook
-                    ;;
-                2)
-                    read -p "Enter email address for reports: " EMAIL_RECIPIENT
-                    ;;
-                3)
-                    DISCORD_NOTIFICATION=true
-                    get_discord_webhook
-                    read -p "Enter email address for reports: " EMAIL_RECIPIENT
-                    ;;
-                4)
-                    DISCORD_NOTIFICATION=false
-                    EMAIL_RECIPIENT=""
-                    ;;
-            esac
-            break
-        else
-            echo "Invalid selection. Please try again."
-        fi
-    done
-    
-    # Show configuration summary and ask for confirmation
-    echo -e "\n${BLUE}Configuration Summary:${NC}"
-    echo "Maintenance Type: $( [ "$FULL_MAINTENANCE" = true ] && echo "Full" || echo "Basic" )"
-    echo "Run Updates: $( [ "$RUN_UPDATES" = true ] && echo "Yes" || echo "No" )"
-    echo "Run Security Checks: $( [ "$RUN_SECURITY" = true ] && echo "Yes" || echo "No" )"
-    echo "Run Virus Scanning: $( [ "$RUN_VIRUS_SCAN" = true ] && echo "Yes" || echo "No" )"
-    echo "Create Backups: $( [ "$CREATE_BACKUPS" = true ] && echo "Yes" || echo "No" )"
-    echo "Verbose Output: $( [ "$VERBOSE" = true ] && echo "Yes" || echo "No" )"
-    echo "Discord Notifications: $( [ "$DISCORD_NOTIFICATION" = true ] && echo "Yes" || echo "No" )"
-    echo "Email Notifications: $( [ -n "$EMAIL_RECIPIENT" ] && echo "Yes ($EMAIL_RECIPIENT)" || echo "No" )"
-    
-    read -p "Proceed with these settings? (y/N): " confirm
-    if [[ ! $confirm =~ ^[Yy] ]]; then
-        echo -e "\n${RED}Setup cancelled by user${NC}"
-        exit 1
-    fi
-
-    echo -e "\n${BLUE}Starting maintenance process...${NC}"
-}
-
-# Check system requirements
-check_requirements() {
-    local required_commands=("pct" "apt-get" "ping" "awk" "grep" "curl")
-    for cmd in "${required_commands[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then
-            log_error "Required command '$cmd' not found"
-            exit 1
-        fi
-    done
-    
-    # If backups are enabled, check for vzdump
-    if [ "$CREATE_BACKUPS" = true ]; then
-        if ! command -v vzdump &> /dev/null; then
-            log_error "vzdump command not found. Required for backups."
-            exit 1
-        fi
-    fi
-}
-
-# Check disk space
-check_disk_space() {
-    local min_space=1000000  # in KB
-    local available_space
-    available_space=$(df /var/lib/vz | awk 'NR==2 {print $4}')
-    if [ "$available_space" -lt "$min_space" ]; then
-        log_warning "Low disk space detected: $(($available_space/1024))MB available"
-        return 1
-    fi
-    return 0
-}
-
-# Check container tools
-check_container_tools() {
-    local container_id="$1"
-    local name=$(pct config "$container_id" | grep -w "hostname" | cut -d' ' -f2)
-    
-    if lxc-attach -n "$container_id" -- which apt-get >/dev/null 2>&1; then
-        if [ "$VERBOSE" = true ]; then
-            log_detailed "Container $container_id is Ubuntu/Debian based"
-        fi
-        
-        if pct exec "$container_id" -- ping -c 1 -W 5 1.1.1.1 >/dev/null 2>&1; then
-            if [ "$VERBOSE" = true ]; then
-                log_detailed "Container $container_id has network connectivity"
-            fi
-            return 0
-        else
-            log_warning "Container $container_id ($name) has network issues"
-            if [ "$VERBOSE" = true ]; then
-                log_detailed "Network diagnostic for container $container_id:"
-                pct exec "$container_id" -- ping -c 1 -W 5 1.1.1.1 2>&1 || true
-            fi
-            return 1
-        fi
-    else
-        log_warning "Container $container_id may not be a Debian/Ubuntu based system"
-        return 1
-    fi
-}
-
-# Backup container
-backup_container() {
-    local container_id="$1"
-    local backup_dir="/var/lib/vz/dump"
-    local backup_name="ct-${container_id}-$(date +%Y%m%d)"
-    
-    log_message "Creating backup of container $container_id"
-    
-    # Check backup directory
-    if [ ! -d "$backup_dir" ]; then
-        mkdir -p "$backup_dir"
-    fi
-    
-    # Check disk space before backup
-    local available_space
-    available_space=$(df -k "$backup_dir" | awk 'NR==2 {print $4}')
-    local required_space=5242880  # 5GB in KB
-    
-    if [ "$available_space" -lt "$required_space" ]; then
-        log_warning "Insufficient disk space for backup of container $container_id"
-        return 1
-    fi
-    
-    # Attempt backup with error handling
-    if vzdump "$container_id" --compress gzip --dumpdir "$backup_dir" > /dev/null 2>&1; then
-        log_success "Backup created for container $container_id"
-        return 0
-    else
-        log_error "Backup failed for container $container_id"
-        return 1
-    fi
-}
-
-# Check container network
-check_container_network() {
-    local container_id="$1"
-    log_message "Running network diagnostics for container $container_id"
-    
-    # Check DNS configuration
-    log_detailed "DNS Configuration:"
-    if ! pct exec "$container_id" -- cat /etc/resolv.conf >> "$DETAILED_LOG" 2>&1; then
-        log_warning "Cannot read resolv.conf in container $container_id"
-    fi
-    
-    # Check IP configuration
-    log_detailed "IP Configuration:"
-    if ! pct exec "$container_id" -- ip addr show >> "$DETAILED_LOG" 2>&1; then
-        log_warning "Cannot get IP configuration for container $container_id"
-    fi
-    
-    # Check routing
-    log_detailed "Routing Table:"
-    if ! pct exec "$container_id" -- ip route >> "$DETAILED_LOG" 2>&1; then
-        log_warning "Cannot get routing table for container $container_id"
-    fi
-    
-    # Test basic connectivity
-    log_detailed "Testing basic connectivity:"
-    if pct exec "$container_id" -- ping -c 1 -W 5 1.1.1.1 >> "$DETAILED_LOG" 2>&1; then
-        log_detailed "Container $container_id can reach 1.1.1.1"
-        
-        # Test DNS resolution
-        if pct exec "$container_id" -- ping -c 1 -W 5 google.com >> "$DETAILED_LOG" 2>&1; then
-            log_detailed "Container $container_id has working DNS resolution"
-            return 0
-        else
-            log_warning "Container $container_id has network but DNS resolution failed"
-            # Try to fix DNS
-            pct exec "$container_id" -- bash -c '
-                echo "nameserver 8.8.8.8" > /etc/resolv.conf
-                echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-            '
-        fi
-    else
-        log_warning "Container $container_id cannot reach 1.1.1.1"
-    fi
-    
-    # Check if package manager can reach repositories
-    log_detailed "Testing package manager:"
-    if pct exec "$container_id" -- apt-get update -qq >> "$DETAILED_LOG" 2>&1; then
-        log_detailed "Package manager in container $container_id can reach repositories"
-        return 0
-    else
-        log_warning "Package manager in container $container_id cannot reach repositories"
-    fi
-    
-    return 1
-}
-
-# Check container status
-check_container_status() {
-    local container_id="$1"
-    local container_name
-    
-    # Check if container is running
-    if ! pct status "$container_id" | grep -q "running"; then
-        log_detailed "Container $container_id is not running - skipping"
-        CONTAINER_STATUS["$container_id"]="DOWN"
-        SKIPPED_CONTAINERS+=("CT$container_id")
-        return 1
-    fi
-
-    container_name=$(pct config "$container_id" | grep -w "hostname" | cut -d' ' -f2)
-    
-    # Check DNS configuration
-    if [ "$VERBOSE" = true ]; then
-        log_detailed "Checking DNS configuration for container $container_id"
-        pct exec "$container_id" -- cat /etc/resolv.conf >> "$DETAILED_LOG" 2>&1 || log_detailed "Could not check resolv.conf in container $container_id"
-    fi
-
-    # Get container IP
-    local container_ip
-    container_ip=$(pct exec "$container_id" -- ip -4 addr show scope global | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n1 || echo "N/A")
-    CONTAINER_IPS["$container_id"]=$container_ip
-
-    if [ "$container_ip" != "N/A" ]; then
-        CONTAINER_STATUS["$container_id"]="UP"
-        log_detailed "Container $container_id ($container_name) is up with IP: $container_ip"
-        
-        # Basic connectivity test
-        if pct exec "$container_id" -- ping -c 1 -W 5 1.1.1.1 >/dev/null 2>&1; then
-            log_detailed "Container $container_id has network connectivity"
-            
-            # DNS resolution test
-            if pct exec "$container_id" -- ping -c 1 -W 5 google.com >/dev/null 2>&1; then
-                log_detailed "Container $container_id has working DNS resolution"
-                
-                # Test package management (only if we need to run updates)
-                if [ "$RUN_UPDATES" = true ]; then
-                    if pct exec "$container_id" -- apt-get update -qq >/dev/null 2>&1; then
-                        log_detailed "Container $container_id has working package management"
-                        return 0
-                    else
-                        log_warning "Container $container_id has network but package management failed"
-                        if [ "$VERBOSE" = true ]; then
-                            check_container_network "$container_id"
-                        fi
-                        # If we're only doing virus scanning, still return success
-                        if [ "$RUN_UPDATES" = false ] && [ "$RUN_VIRUS_SCAN" = true ]; then
-                            return 0
-                        fi
-                        return 1
-                    fi
-                else
-                    # We don't need package management for virus scanning only
-                    return 0
-                fi
-            else
-                log_warning "Container $container_id has network but DNS is not working"
-                # Try to fix DNS
-                pct exec "$container_id" -- bash -c '
-                    echo "nameserver 8.8.8.8" > /etc/resolv.conf
-                    echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-                '
-                # Verify DNS fix
-                if pct exec "$container_id" -- ping -c 1 -W 5 google.com >/dev/null 2>&1; then
-                    log_detailed "DNS fixed for container $container_id"
-                    return 0
-                else
-                    if [ "$VERBOSE" = true ]; then
-                        check_container_network "$container_id"
-                    fi
-                    # If we're only doing virus scanning, still return success
-                    if [ "$RUN_UPDATES" = false ] && [ "$RUN_VIRUS_SCAN" = true ]; then
-                        return 0
-                    fi
-                fi
-            fi
-        else
-            log_warning "Container $container_id cannot reach 1.1.1.1"
-            if [ "$VERBOSE" = true ]; then
-                check_container_network "$container_id"
-            fi
-        fi
-    fi
-
-    # If we're only doing virus scanning, we don't need network connectivity
-    if [ "$RUN_UPDATES" = false ] && [ "$RUN_VIRUS_SCAN" = true ]; then
-        return 0
-    fi
-
-    CONTAINER_STATUS["$container_id"]="DOWN"
-    NETWORK_ISSUES+=("CT$container_id")
-    log_detailed "Container $container_id ($container_name) has network issues"
-    return 1
-}
-
-# Cleanup function
-cleanup() {
-    local days_to_keep=7
-    find "$LOG_DIR" -type f -name "maintenance_*.log" -mtime +"$days_to_keep" -delete 2>/dev/null
-    find "$LOG_DIR" -type f -name "maintenance_*_detailed.log" -mtime +"$days_to_keep" -delete 2>/dev/null
-    find "$LOG_DIR" -type f -name "maintenance_*_summary.txt" -mtime +"$days_to_keep" -delete 2>/dev/null
-}
-
-# Update container
-# Update container
-update_container() {
-    local container_id="$1"
-    
-    log_message "Updating container $container_id"
-    
-    # Update package lists
-    if ! pct exec "$container_id" -- apt-get update >> "$DETAILED_LOG" 2>&1; then
-        log_error "Failed to update package lists for container $container_id"
-        return 1
-    fi
-    
-    # Perform dist-upgrade instead of upgrade to properly handle dependencies
-    if ! pct exec "$container_id" -- apt-get dist-upgrade -y >> "$DETAILED_LOG" 2>&1; then
-        log_error "Failed to upgrade packages for container $container_id"
-        return 1
-    fi
-    
-    return 0
-}
-
-# Security checks
-security_checks() {
-    local container_id="$1"
-    [ "$VERBOSE" = true ] && log_message "Running security checks for container $container_id"
-    
-    # Check if auth.log exists before trying to read it
-    if pct exec "$container_id" -- test -f /var/log/auth.log; then
-        local failed_logins
-        failed_logins=$(pct exec "$container_id" -- grep 'Failed password' /var/log/auth.log 2>/dev/null | wc -l || echo "0")
-        if [ "$failed_logins" -gt 10 ]; then
-            log_warning "High number of failed login attempts ($failed_logins) in container $container_id"
-        fi
-    else
-        log_detailed "No auth.log found in container $container_id"
-    fi
-    
-    [ "$VERBOSE" = true ] && log_message "Checking running services in container $container_id"
-    pct exec "$container_id" -- ss -tulpn >> "$DETAILED_LOG" 2>&1 || log_detailed "Could not check services in container $container_id"
-    
-    # Check for security updates without requiring syslog
-    local security_updates
-    security_updates=$(pct exec "$container_id" -- apt-get -s upgrade | grep -i security) || true
-    if [ -n "$security_updates" ]; then
-        log_warning "Security updates available for container $container_id"
-        echo "$security_updates" >> "$DETAILED_LOG"
-    fi
-}
-
-# Update host system
-update_host_system() {
-    log_message "Updating host system"
-    if ! pveupgrade >> "$DETAILED_LOG" 2>&1; then
-        log_error "Host system update failed"
-        return 1
-    fi
-    
-    # Check if reboot is needed
-    if [ -f /var/run/reboot-required ]; then
-        log_warning "System reboot is required after updates"
-    fi
-    
-    log_success "Host system update completed"
-    return 0
-}
-
-# Setup ClamAV
-setup_clamav() {
-    if [ "$RUN_VIRUS_SCAN" = true ]; then
-        log_message "Setting up ClamAV..."
-        
-        # Check if ClamAV is installed
-        if ! command -v clamdscan &> /dev/null; then
-            log_message "Installing ClamAV..."
-            apt-get update >> "$DETAILED_LOG" 2>&1
-            apt-get install -y clamav clamav-daemon >> "$DETAILED_LOG" 2>&1
-        fi
-        
-        # Update virus definitions if older than 1 day
-        if [ ! -f "/var/lib/clamav/daily.cvd" ] || [ $(find /var/lib/clamav/daily.cvd -mtime +1 -print | wc -l) -ne 0 ]; then
-            log_message "Updating ClamAV virus definitions..."
-            systemctl stop clamav-freshclam >> "$DETAILED_LOG" 2>&1
-            freshclam >> "$DETAILED_LOG" 2>&1
-            systemctl start clamav-freshclam >> "$DETAILED_LOG" 2>&1
-        fi
-        
-        # Make sure the daemon is running
-        if ! systemctl is-active --quiet clamav-daemon; then
-            log_message "Starting ClamAV daemon..."
-            systemctl restart clamav-daemon >> "$DETAILED_LOG" 2>&1
-        fi
-        
-        # Verify daemon status
-        if systemctl is-active --quiet clamav-daemon; then
-            log_success "ClamAV setup completed"
-            return 0
-        else
-            log_error "Failed to start ClamAV daemon"
-            return 1
-        fi
-    fi
-    return 0
-}
-
-# Run virus scan
-run_virus_scan() {
-    local container_id="$1"
-    local container_name=$(pct config "$container_id" | grep -w "hostname" | cut -d' ' -f2)
-    local temp_mount="/tmp/clamscan_${container_id}_$(date +%s)"
-    
-    log_message "Running virus scan for container $container_id ($container_name)"
-    
-    # Create temporary mount point
-    mkdir -p "$temp_mount"
-    
-    # Determine the container's root filesystem location
-    local rootfs_path
-    if [ -d "/var/lib/lxc/$container_id/rootfs" ]; then
-        # Direct LXC path
-        rootfs_path="/var/lib/lxc/$container_id/rootfs"
-    elif [ -d "/var/lib/vz/root/$container_id" ]; then
-        # Proxmox VE path
-        rootfs_path="/var/lib/vz/root/$container_id"
-    else
-        log_error "Cannot locate root filesystem for container $container_id"
-        rmdir "$temp_mount"
-        return 1
-    fi
-    
-    # Mount the container's filesystem (read-only for security)
-    if ! mount -o bind,ro "$rootfs_path" "$temp_mount"; then
-        log_error "Failed to mount container $container_id filesystem"
-        rmdir "$temp_mount"
-        return 1
-    fi
-    
-    log_message "Scanning container $container_id for viruses..."
-    
-    # Create a specific log file for this container's scan
-    local container_scan_log="${DETAILED_LOG}.${container_id}.scan"
-    
-    # Perform the scan
-    local scan_status=0
-    if clamdscan --fdpass "$temp_mount" > "$container_scan_log" 2>&1; then
-        log_success "Virus scan completed successfully for container $container_id"
-    else
-        local exit_code=$?
-        if [ $exit_code -eq 1 ]; then
-            log_warning "Viruses found in container $container_id!"
-            scan_status=1
-        else
-            log_error "Scan error for container $container_id (exit code: $exit_code)"
-            scan_status=2
-        fi
-    fi
-    
-    # Extract and log scan statistics
-    local infected=$(grep "Infected files:" "$container_scan_log" | tail -1 | awk '{print $3}')
-    local scanned=$(grep "Scanned files:" "$container_scan_log" | tail -1 | awk '{print $3}')
-    
-    # Append container results to the main detailed log
-    {
-        echo "================================================================"
-        echo "=== Container $container_id ($container_name) Virus Scan Details ==="
-        echo "================================================================"
-        echo "Timestamp: $(date)"
-        echo "Files scanned: $scanned"
-        echo "Infected files: $infected"
-        
-        # Add specific infection details if any were found
-        if [ "$infected" != "0" ]; then
-            echo "--- Infection Details ---"
-            grep "FOUND" "$container_scan_log"
-            echo "-----------------------"
-            INFECTED_CONTAINERS+=("CT$container_id")
-        fi
-        
-        echo "" # Empty line for better readability
-    } >> "$DETAILED_LOG"
-    
-    # Store scan result for summary
-    CONTAINER_SCAN_RESULTS["$container_id"]=$infected
-    
-    # Always cleanup the mount
-    umount "$temp_mount"
-    rmdir "$temp_mount"
-    rm -f "$container_scan_log"
-    
-    if [ "$infected" != "0" ]; then
-        log_warning "Found $infected infected files in container $container_id"
-    else
-        log_success "No viruses found in container $container_id"
-    fi
-    
-    return $scan_status
-}
-
-# Generate summary
-generate_summary() {
-    # Write summary to file
-    {
-        echo "=== Maintenance and Security Summary ==="
-        echo "Timestamp: $(date)"
-        echo "Total Containers: $TOTAL_CONTAINERS"
-        
-        if [ "$RUN_UPDATES" = true ]; then
-            echo "Successfully Updated: ${#UPDATED_CONTAINERS[@]}"
-            echo "Failed Updates: ${#FAILED_CONTAINERS[@]}"
-        fi
-        
-        echo "Skipped Containers: ${#SKIPPED_CONTAINERS[@]}"
-        echo "Network Issues: ${#NETWORK_ISSUES[@]}"
-        
-        if [ "$RUN_VIRUS_SCAN" = true ]; then
-            echo "Infected Containers: ${#INFECTED_CONTAINERS[@]}"
-        fi
-        
-        if [ "$RUN_UPDATES" = true ] && [ ${#UPDATED_CONTAINERS[@]} -gt 0 ]; then
-            echo -e "\nSuccessfully Updated Containers:"
-            printf '%s\n' "${UPDATED_CONTAINERS[@]}"
-        fi
-        
-        if [ "$RUN_UPDATES" = true ] && [ ${#FAILED_CONTAINERS[@]} -gt 0 ]; then
-            echo -e "\nFailed Containers:"
-            printf '%s\n' "${FAILED_CONTAINERS[@]}"
-        fi
-        
-        if [ ${#SKIPPED_CONTAINERS[@]} -gt 0 ]; then
-            echo -e "\nSkipped Containers:"
-            printf '%s\n' "${SKIPPED_CONTAINERS[@]}"
-        fi
-        
-        if [ ${#NETWORK_ISSUES[@]} -gt 0 ]; then
-            echo -e "\nContainers with Network Issues:"
-            printf '%s\n' "${NETWORK_ISSUES[@]}"
-        fi
-        
-        if [ "$RUN_VIRUS_SCAN" = true ] && [ ${#INFECTED_CONTAINERS[@]} -gt 0 ]; then
-            echo -e "\nContainers with Infections:"
-            printf '%s\n' "${INFECTED_CONTAINERS[@]}"
-        fi
-        
-        echo -e "\nDetailed logs available at: $DETAILED_LOG"
-    } > "$SUMMARY_FILE" 2>&1
-
-    # Display the summary on the console too
-    cat "$SUMMARY_FILE"
-
-    # Send summary to Discord if enabled
-    if [ "$DISCORD_NOTIFICATION" = true ]; then
-        send_discord_notification "$(cat "$SUMMARY_FILE")"
-    fi
-    
-    # Send email report if configured
-    if [ -n "$EMAIL_RECIPIENT" ]; then
-        send_email_report
-    fi
-}
-
-# Main execution function
-main() {
-    check_root
-    check_requirements
-    
-    # Initialize logs
-    echo "=== Proxmox Container Security and Maintenance - $(date) ===" > "$LOG_FILE"
-    echo "=== Detailed Log - $(date) ===" > "$DETAILED_LOG"
-    
-    # Setup ClamAV if virus scanning is enabled
-    if [ "$RUN_VIRUS_SCAN" = true ]; then
-        setup_clamav
-    fi
-    
-    # Update host system if doing full maintenance
-    if [ "$FULL_MAINTENANCE" = true ] || [ "$RUN_UPDATES" = true ]; then
-        update_host_system
-    fi
-    
-    # Get list of RUNNING containers only
-    local containers
-    mapfile -t containers < <(pct list | grep "running" | awk '{print $1}')
-    TOTAL_CONTAINERS=${#containers[@]}
-    
-    if [ $TOTAL_CONTAINERS -eq 0 ]; then
-        log_message "No running containers found"
-        generate_summary
-        cleanup
-        exit 0
-    fi
-    
-    # Process each container
-    for container_id in "${containers[@]}"; do
-        ((CURRENT_CONTAINER++))
-        progress "Processing container $container_id ($CURRENT_CONTAINER of $TOTAL_CONTAINERS)"
-        
-        # Check container status
-        if ! check_container_status "$container_id"; then
-            if [ "$VERBOSE" = true ]; then
-                log_message "Running network diagnostics for container $container_id"
-                check_container_network "$container_id" >> "$DETAILED_LOG" 2>&1
-            fi
-            # For virus scan only, we proceed even if network check fails
-            if [ "$RUN_UPDATES" = true ] && [ "$RUN_VIRUS_SCAN" = false ]; then
-                continue
-            fi
-        fi
-        
-        # Create backup if enabled
-        if [ "$CREATE_BACKUPS" = true ]; then
-            backup_container "$container_id"
-        fi
-        
-        # Run updates if enabled
-        if [ "$RUN_UPDATES" = true ]; then
-            if ! check_container_tools "$container_id"; then
-                if [ "$VERBOSE" = true ]; then
-                    log_message "Container tools check failed, running diagnostics for container $container_id"
-                    check_container_network "$container_id" >> "$DETAILED_LOG" 2>&1
-                fi
-                FAILED_CONTAINERS+=("CT$container_id")
-                # Still proceed with virus scan if that's enabled
-                if [ "$RUN_VIRUS_SCAN" = false ]; then
-                    continue
-                fi
-            else
-                if update_container "$container_id"; then
-                    UPDATED_CONTAINERS+=("CT$container_id")
-                else
-                    FAILED_CONTAINERS+=("CT$container_id")
-                    if [ "$VERBOSE" = true ]; then
-                        log_message "Update failed, running diagnostics for container $container_id"
-                        check_container_network "$container_id" >> "$DETAILED_LOG" 2>&1
-                    fi
-                fi
-            fi
-        fi
-        
-        # Run security checks if enabled
-        if [ "$RUN_SECURITY" = true ]; then
-            security_checks "$container_id"
-        fi
-        
-        # Run virus scan if enabled
-        if [ "$RUN_VIRUS_SCAN" = true ]; then
-            run_virus_scan "$container_id"
-        fi
-    done
-    
-    # Generate and display summary
-    generate_summary
-    
-    # Cleanup old logs
-    cleanup
-    
-    log_message "Maintenance and security check completed"
-}
-
-# Parse command line arguments
-parse_args() {
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -v|--verbose)
-                VERBOSE=true
-                shift
-                ;;
-            -f|--full)
-                FULL_MAINTENANCE=true
-                RUN_SECURITY=true
-                RUN_VIRUS_SCAN=true
-                RUN_UPDATES=true
-                shift
-                ;;
-            -b|--backup)
-                CREATE_BACKUPS=true
-                shift
-                ;;
-            -u|--update-only)
-                FULL_MAINTENANCE=false
-                RUN_SECURITY=false
-                RUN_VIRUS_SCAN=false
-                RUN_UPDATES=true
-                shift
-                ;;
-            -s|--security-only)
-                FULL_MAINTENANCE=false
-                RUN_SECURITY=true
-                RUN_VIRUS_SCAN=true
-                RUN_UPDATES=false
-                shift
-                ;;
-            -vs|--virus-scan-only)
-                FULL_MAINTENANCE=false
-                RUN_SECURITY=false
-                RUN_VIRUS_SCAN=true
-                RUN_UPDATES=false
-                shift
-                ;;
-            -d|--discord)
-                DISCORD_NOTIFICATION=true
-                shift
-                ;;
-            -e|--email)
-                if [[ $# -gt 1 && ! $2 =~ ^- ]]; then
-                    EMAIL_RECIPIENT="$2"
-                    shift 2
-                else
-                    log_error "Email address required for -e|--email option"
-                    exit 1
-                fi
-                ;;
-            -h|--help)
-                echo "Proxmox Container Security and Maintenance Script v$VERSION"
-                echo ""
-                echo "Usage: $0 [options]"
-                echo ""
-                echo "Options:"
-                echo "  -v, --verbose         Enable verbose output"
-                echo "  -f, --full            Run full maintenance (updates, security, virus scan)"
-                echo "  -b, --backup          Create backups before making changes"
-                echo "  -u, --update-only     Run only system updates"
-                echo "  -s, --security-only   Run only security checks and virus scan"
-                echo "  -vs, --virus-scan-only Run only virus scan"
-                echo "  -d, --discord         Enable Discord notifications"
-                echo "  -e, --email EMAIL     Send email report to specified address"
-                echo "  -h, --help            Display this help message"
-                echo ""
-                echo "If no options are provided, the script runs in interactive mode."
-                exit 0
-                ;;
-            *)
-                log_error "Unknown option: $1"
-                echo "Use -h or --help to see available options."
-                exit 1
-                ;;
-        esac
-    done
-}
-
-# Script entry point
-if [ $# -eq 0 ]; then
-    # No arguments, run in interactive mode
-    check_root
-    setup_script
-else
-    # Parse command line arguments
-    parse_args "$@"
-    # Check root after arg parsing to allow help to work for non-root users
-    check_root
-    get_discord_webhook
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}This script must be run as root${NC}" 
+   exit 1
 fi
 
-# Run the main function
-main
-exit_code=$?
+# Create log directory if it doesn't exist
+mkdir -p "$LOG_DIR"
 
-exit $exit_code
+# Start detailed logging
+echo "=== Detailed Log - $(date) ===" > "$DETAILED_LOG"
+
+# Function to check for script updates
+check_for_updates() {
+    log_and_echo "Checking for script updates..." "info"
+    
+    # Get latest version from GitHub
+    local LATEST_VERSION=$(curl -s https://raw.githubusercontent.com/lowrisk75/proxmox-maintenance-security/main/version.txt 2>/dev/null)
+    
+    if [[ -n "$LATEST_VERSION" && "$LATEST_VERSION" != "$SCRIPT_VERSION" ]]; then
+        log_and_echo "New version available: $LATEST_VERSION (Current: $SCRIPT_VERSION)" "warning"
+        log_and_echo "Get the latest version at: https://github.com/lowrisk75/proxmox-maintenance-security" "info"
+        echo ""
+        echo -e "${YELLOW}=============================================================${NC}"
+        echo -e "${YELLOW}  New version available: $LATEST_VERSION (Current: $SCRIPT_VERSION)${NC}"
+        echo -e "${YELLOW}  Visit: https://github.com/lowrisk75/proxmox-maintenance-security${NC}"
+        echo -e "${YELLOW}=============================================================${NC}"
+        echo ""
+    else
+        log_and_echo "You are running the latest version: $SCRIPT_VERSION" "success"
+    fi
+}
+
+# Function to print banner
+print_banner() {
+    echo -e "${BLUE}"
+    echo "==============================================================="
+    echo "  PVESecure - Proxmox VE Security and Maintenance Script v$SCRIPT_VERSION"
+    echo "==============================================================="
+    echo -e "${NC}"
+    echo -e "${GREEN}  Created by: ConnectedSecure${NC}"
+    echo -e "${GREEN}  YouTube: ${NC}https://www.youtube.com/channel/UCSNleiwJs4VC-VYuRJ0nnjg"
+    echo -e "${GREEN}  X/Twitter: ${NC}@SecureCnnected"
+    echo ""
+}
+
+# Function to load configuration
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+        echo "Configuration loaded from $CONFIG_FILE"
+    else
+        echo "No configuration file found, creating new configuration."
+    fi
+}
+
+# Function to save configuration
+save_config() {
+    echo "# PVESecure Configuration File" > "$CONFIG_FILE"
+    echo "# Created on $(date)" >> "$CONFIG_FILE"
+    echo >> "$CONFIG_FILE"
+    
+    if [[ -n "$EMAIL" ]]; then
+        echo "EMAIL=\"$EMAIL\"" >> "$CONFIG_FILE"
+    fi
+    
+    if [[ -n "$DISCORD_WEBHOOK" ]]; then
+        echo "DISCORD_WEBHOOK=\"$DISCORD_WEBHOOK\"" >> "$CONFIG_FILE"
+    fi
+    
+    chmod 600 "$CONFIG_FILE"
+    echo "Configuration saved to $CONFIG_FILE"
+}
+
+# Function to log and echo output
+log_and_echo() {
+    local text="$1"
+    local level="${2:-normal}"
+
+    # Echo with appropriate color based on level
+    case $level in
+        success)
+            echo -e "${GREEN}$text${NC}"
+            ;;
+        error)
+            echo -e "${RED}$text${NC}"
+            ;;
+        warning)
+            echo -e "${YELLOW}$text${NC}"
+            ;;
+        info)
+            echo -e "${BLUE}$text${NC}"
+            ;;
+        *)
+            echo "$text"
+            ;;
+    esac
+
+    # Add to logs
+    echo "$text" >> "$DETAILED_LOG"
+    
+    # Add to summary log with timestamp if error or warning
+    if [[ "$level" == "error" || "$level" == "warning" ]]; then
+        echo "$(date +%H:%M:%S) - $text" >> "$SUMMARY_LOG"
+    fi
+}
+
+# Function to display interactive menu with timeout
+display_interactive_menu() {
+    echo -e "${YELLOW}Please select an operation:${NC}"
+    echo "1) Full System Maintenance (Updates + Security)"
+    echo "2) Security Checks Only"
+    echo "3) System Updates Only"
+    echo "4) Full System Maintenance with Backups"
+    echo "5) Exit"
+    echo
+    echo -e "${YELLOW}Defaulting to Full System Maintenance in 10 seconds...${NC}"
+    
+    # Read user input with timeout
+    read -t 10 -p "Enter your choice [1-5]: " choice
+    
+    # Default to option 1 if no input
+    if [ -z "$choice" ]; then
+        echo -e "\nTimeout reached. Proceeding with Full System Maintenance..."
+        choice=1
+    fi
+    
+    # Process user choice
+    case $choice in
+        1)
+            DO_UPDATE=true
+            DO_SECURITY=true
+            DO_BACKUP=false
+            echo "Selected: Full System Maintenance"
+            ;;
+        2)
+            DO_UPDATE=false
+            DO_SECURITY=true
+            DO_BACKUP=false
+            echo "Selected: Security Checks Only"
+            ;;
+        3)
+            DO_UPDATE=true
+            DO_SECURITY=false
+            DO_BACKUP=false
+            echo "Selected: System Updates Only"
+            ;;
+        4)
+            DO_UPDATE=true
+            DO_SECURITY=true
+            DO_BACKUP=true
+            echo "Selected: Full System Maintenance with Backups"
+            ;;
+        5)
+            echo "Exiting..."
+            exit 0
+            ;;
+        *)
+            echo -e "${RED}Invalid selection. Defaulting to Full System Maintenance.${NC}"
+            DO_UPDATE=true
+            DO_SECURITY=true
+            DO_BACKUP=false
+            ;;
+    esac
+    
+    # Load notification settings from config
+    if [[ -n "$DISCORD_WEBHOOK" ]]; then
+        DISCORD_NOTIFY=true
+    fi
+    
+    if [[ -n "$EMAIL" ]]; then
+        EMAIL_NOTIFY=true
+    fi
+    
+    # Only ask for Discord webhook if it's not already configured
+    if [[ -z "$DISCORD_WEBHOOK" ]]; then
+        echo
+        read -p "Enable Discord notifications? (y/n) [n]: " discord_choice
+        if [[ "$discord_choice" == "y" || "$discord_choice" == "Y" ]]; then
+            DISCORD_NOTIFY=true
+            read -p "Enter Discord webhook URL: " DISCORD_WEBHOOK
+        fi
+    else
+        DISCORD_NOTIFY=true
+    fi
+    
+    # Only ask for email if it's not already configured
+    if [[ -z "$EMAIL" ]]; then
+        echo
+        read -p "Enable email notifications? (y/n) [n]: " email_choice
+        if [[ "$email_choice" == "y" || "$email_choice" == "Y" ]]; then
+            EMAIL_NOTIFY=true
+            read -p "Enter email address for notifications: " EMAIL
+        fi
+    else
+        EMAIL_NOTIFY=true
+    fi
+}
+
+# Function to initialize the script
+initialize() {
+    print_banner
+    log_and_echo "PVESecure Script Started - $(date)" "info"
+    
+    # Check for updates
+    check_for_updates
+    
+    echo "=== Summary Log - $(date) ===" > "$SUMMARY_LOG"
+    echo "Proxmox Maintenance and Security Script" >> "$SUMMARY_LOG"
+    echo "=====================================" >> "$SUMMARY_LOG"
+    
+    # Save config
+    save_config
+    
+    log_and_echo "Configuration initialized with the following options:" "info"
+    [[ "$DO_UPDATE" == "true" ]] && log_and_echo " - System Updates: Enabled" "info"
+    [[ "$DO_SECURITY" == "true" ]] && log_and_echo " - Security Checks: Enabled" "info"
+    [[ "$DO_BACKUP" == "true" ]] && log_and_echo " - Backup Operations: Enabled" "info"
+    [[ "$EMAIL_NOTIFY" == "true" ]] && log_and_echo " - Email Notifications: Enabled" "info"
+    [[ "$DISCORD_NOTIFY" == "true" ]] && log_and_echo " - Discord Notifications: Enabled" "info"
+}
+
+#------------------------------
+# SYSTEM UPDATE FUNCTIONS
+#------------------------------
+
+# Function to update the Proxmox host
+update_host() {
+    log_and_echo "Starting system upgrade: apt-get dist-upgrade" "info"
+    
+    # Redirect output to log file
+    {
+        apt-get update
+        apt-get dist-upgrade -y
+    } >> "$DETAILED_LOG" 2>&1
+    
+    if [[ $? -eq 0 ]]; then
+        log_and_echo "System upgrade completed successfully" "success"
+        
+        # Check if reboot is needed
+        if [[ -f /var/run/reboot-required ]]; then
+            log_and_echo "System requires a reboot after updates" "warning"
+        fi
+    else
+        log_and_echo "Error during system upgrade" "error"
+    fi
+}
+
+# Function to update containers
+update_containers() {
+    log_and_echo "Starting container updates..." "info"
+    
+    # Get all running containers
+    CONTAINERS=$(pct list | grep running | awk '{print $1}')
+    
+    for CTID in $CONTAINERS; do
+        CONTAINER_NAME=$(pct config "$CTID" | grep -oP 'name: \K.*' || echo "Container $CTID")
+        
+        # Better IP detection - get only non-loopback addresses
+        CONTAINER_IP=$(pct exec "$CTID" -- bash -c "ip -4 addr show | grep -v '127.0.0.1' | grep inet | head -1 | awk '{print \$2}' | cut -d/ -f1")
+        if [[ -z "$CONTAINER_IP" ]]; then
+            CONTAINER_IP="Unknown IP"
+        fi
+        
+        log_and_echo "Container $CTID ($CONTAINER_NAME) is up with IP: $CONTAINER_IP" "info"
+        
+        # Check if container is responsive
+        if ! pct exec "$CTID" -- bash -c "echo 'Container access test'" > /dev/null 2>&1; then
+            log_and_echo "ERROR: Cannot access container $CTID - skipping updates" "error"
+            continue
+        fi
+        
+        # Check network connectivity with more reliable method
+        PING_STATUS=$(pct exec "$CTID" -- bash -c "ping -c 1 8.8.8.8 > /dev/null 2>&1 && echo 'success' || echo 'fail'")
+        
+        if [[ "$PING_STATUS" == "success" ]]; then
+            log_and_echo "Container $CTID has network connectivity" "success"
+            
+            # Check DNS resolution
+            DNS_STATUS=$(pct exec "$CTID" -- bash -c "ping -c 1 google.com > /dev/null 2>&1 && echo 'success' || echo 'fail'")
+            
+            if [[ "$DNS_STATUS" == "success" ]]; then
+                log_and_echo "Container $CTID has working DNS resolution" "success"
+                
+                # Update container packages
+                log_and_echo "Updating packages in container $CTID ($CONTAINER_NAME)..." "info"
+                
+                # Test if apt works in container
+                if pct exec "$CTID" -- bash -c "apt-get update" >> "$DETAILED_LOG" 2>&1; then
+                    log_and_echo "Container $CTID has working package management" "success"
+                    
+                    # Do upgrade
+                    pct exec "$CTID" -- bash -c "apt-get update && apt-get upgrade -y" >> "$DETAILED_LOG" 2>&1
+                else
+                    log_and_echo "WARNING: Failed to update package lists for container $CTID" "warning"
+                fi
+            else
+                log_and_echo "Container $CTID has no working DNS resolution - skipping updates" "warning"
+            fi
+        else
+            log_and_echo "Container $CTID has no network connectivity - skipping updates" "warning"
+        fi
+        
+        # Check for auth.log and secure files (might need sudo) - always try even without network
+        if pct exec "$CTID" -- bash -c "[ -f /var/log/auth.log ]" > /dev/null 2>&1; then
+            log_and_echo "Checking auth.log for container $CTID" "info"
+            pct exec "$CTID" -- bash -c "grep -i 'Failed password' /var/log/auth.log | tail -5" >> "$DETAILED_LOG" 2>&1
+        else
+            log_and_echo "No auth.log found in container $CTID" "warning"
+        fi
+        
+        # Network and service scanning - always try even without network
+        log_and_echo "Scanning network services in container $CTID" "info"
+        pct exec "$CTID" -- bash -c "ss -tulpn" >> "$DETAILED_LOG" 2>&1
+    done
+}
+
+#------------------------------
+# SECURITY CHECK FUNCTIONS
+#------------------------------
+
+# Function to execute ClamAV scan on host
+run_clamav_on_host() {
+    log_and_echo "Verifying ClamAV on host..." "info"
+    
+    # Install ClamAV if not present
+    if ! command -v clamscan >/dev/null 2>&1; then
+        log_and_echo "Installing ClamAV on host..." "info"
+        apt-get update && apt-get install -y clamav clamav-daemon >> "$DETAILED_LOG" 2>&1
+        
+        # Update virus definitions
+        log_and_echo "Updating ClamAV virus definitions..." "info"
+        systemctl stop clamav-freshclam 2>/dev/null
+        freshclam >> "$DETAILED_LOG" 2>&1 || log_and_echo "Warning: Could not update virus definitions" "warning"
+        systemctl start clamav-freshclam 2>/dev/null
+    fi
+    
+    # Run scan on important directories
+    log_and_echo "Starting ClamAV scan on host..." "info"
+    CLAM_LOG="${LOG_DIR}/clamscan_host_${CURRENT_DATE}.log"
+    
+    clamscan --recursive --infected /home /etc /var /root > "$CLAM_LOG" 2>&1
+    
+    # Parse results for reporting
+    INFECTED=$(grep "Infected files" "$CLAM_LOG" 2>/dev/null | awk '{print $3}')
+    SCANNED=$(grep "Scanned files" "$CLAM_LOG" 2>/dev/null | awk '{print $3}')
+    
+    if [[ -n "$INFECTED" && "$INFECTED" -gt 0 ]]; then
+        log_and_echo "⚠️ ALERT: Found $INFECTED infected files out of $SCANNED scanned files on host!" "error"
+        grep -A2 FOUND "$CLAM_LOG" >> "$SUMMARY_LOG" 2>/dev/null
+    else
+        log_and_echo "ClamAV scan completed - No infections found in $SCANNED files" "success"
+    fi
+    
+    log_and_echo "Full scan log available at: $CLAM_LOG" "info"
+}
+
+# Function to run ClamAV scan in a container
+run_clamav_in_container() {
+    local CTID="$1"
+    local CONTAINER_NAME="$2"
+    
+    log_and_echo "Preparing ClamAV scan for container $CTID ($CONTAINER_NAME)..." "info"
+    
+    # Create a virus scan details section in the log
+    echo "================================================================" >> "$DETAILED_LOG"
+    echo "=== Container $CTID ($CONTAINER_NAME) Virus Scan Details ===" >> "$DETAILED_LOG"
+    echo "================================================================" >> "$DETAILED_LOG"
+    echo "Timestamp: $(date)" >> "$DETAILED_LOG"
+    
+    # Check if we can execute commands in container
+    if ! pct exec "$CTID" -- bash -c "echo 'Container access test'" > /dev/null 2>&1; then
+        log_and_echo "ERROR: Cannot access container $CTID - skipping security scan" "error"
+        return
+    fi
+    
+    # Create ClamAV scan log file
+    CLAM_LOG="${LOG_DIR}/clamscan_${CTID}_${CURRENT_DATE}.log"
+    
+    # Check if ClamAV is installed and install if not
+    if ! pct exec "$CTID" -- bash -c 'command -v clamscan >/dev/null 2>&1'; then
+        log_and_echo "ClamAV not found in container $CTID, attempting to install..." "info"
+        
+        # Check if we have network connectivity in container
+        if ! pct exec "$CTID" -- bash -c "ping -c 1 8.8.8.8" > /dev/null 2>&1; then
+            log_and_echo "Container $CTID has no network connectivity - skipping ClamAV installation and scan" "warning"
+            return
+        fi
+        
+        # Try to install ClamAV
+        if ! pct exec "$CTID" -- bash -c 'apt-get update && apt-get install -y clamav' >> "$DETAILED_LOG" 2>&1; then
+            log_and_echo "Failed to install ClamAV in container $CTID - skipping scan" "error"
+            return
+        fi
+        
+        # Try to update virus definitions
+        pct exec "$CTID" -- bash -c 'freshclam' >> "$DETAILED_LOG" 2>&1 || log_and_echo "Warning: Could not update virus definitions in container $CTID" "warning"
+    fi
+    
+    # Run scan on important directories in container
+    log_and_echo "Starting ClamAV scan in container $CTID..." "info"
+    
+    pct exec "$CTID" -- bash -c "clamscan --recursive --infected /home /etc /var/www 2>&1" > "$CLAM_LOG"
+    
+    # Parse results
+    INFECTED=$(grep -a "Infected files" "$CLAM_LOG" 2>/dev/null | awk '{print $3}' | tr -d ':')
+    SCANNED=$(grep -a "Scanned files" "$CLAM_LOG" 2>/dev/null | awk '{print $3}' | tr -d ':')
+    
+    # Output scan details to the logs
+    echo "Files scanned: ${SCANNED:-Unknown}" >> "$DETAILED_LOG"
+    echo "Infected files: ${INFECTED:-Unknown}" >> "$DETAILED_LOG"
+    
+    if [[ -n "$INFECTED" && "$INFECTED" -gt 0 ]]; then
+        log_and_echo "⚠️ ALERT: Found $INFECTED infected files in container $CTID ($CONTAINER_NAME)!" "error"
+        grep -A2 FOUND "$CLAM_LOG" >> "$SUMMARY_LOG" 2>/dev/null
+    else
+        log_and_echo "Container $CTID ($CONTAINER_NAME) scan completed - No infections found" "success"
+    fi
+}
+
+# Function to check for rootkits on host
+run_rootkit_check_on_host() {
+    log_and_echo "Checking for rootkits on host..." "info"
+    
+    # Install rkhunter if not present
+    if ! command -v rkhunter >/dev/null 2>&1; then
+        log_and_echo "Installing rkhunter on host..." "info"
+        apt-get update && apt-get install -y rkhunter >> "$DETAILED_LOG" 2>&1
+    fi
+    
+    # Update rkhunter databases
+    log_and_echo "Updating rkhunter databases..." "info"
+    rkhunter --update >> "$DETAILED_LOG" 2>&1
+    
+    # Run the scan
+    log_and_echo "Running rootkit scan..." "info"
+    RKH_LOG="${LOG_DIR}/rkhunter_host_${CURRENT_DATE}.log"
+    
+    rkhunter --check --sk > "$RKH_LOG" 2>&1
+    
+    # Check for warnings
+    WARNING_COUNT=$(grep -c "Warning:" "$RKH_LOG" 2>/dev/null || echo "0")
+    
+    if [[ "$WARNING_COUNT" -gt 0 ]]; then
+        log_and_echo "⚠️ $WARNING_COUNT warnings found in rootkit scan!" "warning"
+        grep "Warning:" "$RKH_LOG" >> "$SUMMARY_LOG" 2>/dev/null
+    else
+        log_and_echo "Rootkit scan completed - No warnings found" "success"
+    fi
+    
+    log_and_echo "Full rootkit scan log available at: $RKH_LOG" "info"
+}
+
+# Function to run rootkit scan in a container
+run_rootkit_check_in_container() {
+    local CTID="$1"
+    local CONTAINER_NAME="$2"
+    
+    log_and_echo "Checking for rootkits in container $CTID ($CONTAINER_NAME)..." "info"
+    
+    # Check if we can execute commands in container
+    if ! pct exec "$CTID" -- bash -c "echo 'Container access test'" > /dev/null 2>&1; then
+        log_and_echo "ERROR: Cannot access container $CTID - skipping rootkit scan" "error"
+        return
+    fi
+    
+    # Create rootkit scan log file
+    RKH_LOG="${LOG_DIR}/rkhunter_${CTID}_${CURRENT_DATE}.log"
+    
+    # Check if rkhunter is installed and install if not
+    if ! pct exec "$CTID" -- bash -c 'command -v rkhunter >/dev/null 2>&1'; then
+        log_and_echo "Rkhunter not found in container $CTID, attempting to install..." "info"
+        
+        # Check if we have network connectivity in container
+        if ! pct exec "$CTID" -- bash -c "ping -c 1 8.8.8.8" > /dev/null 2>&1; then
+            log_and_echo "Container $CTID has no network connectivity - skipping rkhunter installation and scan" "warning"
+            return
+        fi
+        
+        # Try to install rkhunter
+        if ! pct exec "$CTID" -- bash -c 'apt-get update && apt-get install -y rkhunter' >> "$DETAILED_LOG" 2>&1; then
+            log_and_echo "Failed to install rkhunter in container $CTID - skipping scan" "error"
+            return
+        fi
+    fi
+    
+    # Run the rkhunter scan
+    log_and_echo "Running rkhunter scan in container $CTID..." "info"
+    
+    pct exec "$CTID" -- bash -c 'rkhunter --update && rkhunter --check --sk' > "$RKH_LOG" 2>&1
+    
+    # Check for warnings
+    WARNING_COUNT=$(grep -c "Warning:" "$RKH_LOG" 2>/dev/null || echo "0")
+    
+    if [[ "$WARNING_COUNT" -gt 0 ]]; then
+        log_and_echo "⚠️ $WARNING_COUNT warnings found in container $CTID rootkit scan!" "warning"
+        grep "Warning:" "$RKH_LOG" >> "$SUMMARY_LOG" 2>/dev/null
+    else
+        log_and_echo "Container $CTID rootkit scan completed - No warnings found" "success"
+    fi
+}
+
+# Function to check for NPM vulnerabilities in a container
+check_npm_vulnerabilities() {
+    local CTID="$1"
+    local CONTAINER_NAME="$2"
+    
+    log_and_echo "Checking NPM packages in container $CTID ($CONTAINER_NAME)..." "info"
+    
+    # Check if we can execute commands in container
+    if ! pct exec "$CTID" -- bash -c "echo 'Container access test'" > /dev/null 2>&1; then
+        log_and_echo "ERROR: Cannot access container $CTID - skipping NPM vulnerability check" "error"
+        return
+    fi
+    
+    # Create NPM audit log file
+    NPM_LOG="${LOG_DIR}/npm_audit_${CTID}_${CURRENT_DATE}.log"
+    
+    # Check if npm is available and run audit if possible
+    if ! pct exec "$CTID" -- bash -c 'command -v npm >/dev/null 2>&1'; then
+        log_and_echo "NPM not installed in container $CTID - skipping vulnerability check" "info"
+        return
+    fi
+    
+    # Check if we have network connectivity in container
+    if ! pct exec "$CTID" -- bash -c "ping -c 1 8.8.8.8" > /dev/null 2>&1; then
+        log_and_echo "Container $CTID has no network connectivity - skipping NPM vulnerability check" "warning"
+        return
+    fi
+    
+    # Run NPM audit
+    log_and_echo "Running NPM audit in container $CTID..." "info"
+    
+    pct exec "$CTID" -- bash -c 'if npm help audit >/dev/null 2>&1; then
+        npm audit
+    else
+        echo "NPM audit not available. Consider upgrading NPM."
+    fi' > "$NPM_LOG" 2>&1
+    
+    # Check if vulnerabilities were found
+    if grep -q "vulnerabilities" "$NPM_LOG" 2>/dev/null; then
+        log_and_echo "⚠️ NPM vulnerabilities found in container $CTID ($CONTAINER_NAME)!" "warning"
+        grep "vulnerabilities" "$NPM_LOG" 2>/dev/null | head -1 >> "$SUMMARY_LOG"
+    else
+        log_and_echo "No NPM vulnerabilities found in container $CTID" "success"
+    fi
+}
+# Function to check Docker containers in a container
+check_docker_security() {
+    local CTID="$1"
+    local CONTAINER_NAME="$2"
+    
+    log_and_echo "Checking Docker in container $CTID ($CONTAINER_NAME)..." "info"
+    
+    # Check if we can execute commands in container
+    if ! pct exec "$CTID" -- bash -c "echo 'Container access test'" > /dev/null 2>&1; then
+        log_and_echo "ERROR: Cannot access container $CTID - skipping Docker security check" "error"
+        return
+    fi
+    
+    # Create Docker security log file
+    DOCKER_LOG="${LOG_DIR}/docker_security_${CTID}_${CURRENT_DATE}.log"
+    
+    # Check if Docker is installed
+    if ! pct exec "$CTID" -- bash -c 'command -v docker >/dev/null 2>&1'; then
+        log_and_echo "Docker not installed in container $CTID - skipping Docker security check" "info"
+        return
+    fi
+    
+    # Check if we have network connectivity in container
+    if ! pct exec "$CTID" -- bash -c "ping -c 1 8.8.8.8" > /dev/null 2>&1; then
+        log_and_echo "Container $CTID has no network connectivity - skipping Docker image updates" "warning"
+        
+        # Still check running containers even without network
+        pct exec "$CTID" -- bash -c 'docker ps --format "{{.Names}} [{{.Image}}] - Running for {{.RunningFor}}"' > "$DOCKER_LOG" 2>&1
+        
+        # Log Docker container details
+        log_and_echo "Docker containers in $CTID:" "info"
+        cat "$DOCKER_LOG"
+        return
+    fi
+    
+    # Run Docker security checks
+    log_and_echo "Running Docker security checks in container $CTID..." "info"
+    
+    pct exec "$CTID" -- bash -c 'echo "Docker Version: $(docker version --format "{{.Server.Version}}")"
+        
+        # List running containers
+        echo "Running Containers:"
+        docker ps --format "{{.Names}} [{{.Image}}] - Running for {{.RunningFor}}"
+        
+        # Check for outdated images
+        echo "Checking for outdated images..."
+        for container in $(docker ps --format "{{.Names}}"); do
+            image=$(docker inspect --format="{{.Config.Image}}" $container)
+            echo "Checking for updates to $container using image $image"
+            if docker pull $image 2>/dev/null; then
+                container_id=$(docker inspect --format="{{.Id}}" $container)
+                image_id=$(docker inspect --format="{{.Id}}" $image)
+                
+                if [ "$container_id" != "$image_id" ]; then
+                    echo "⚠️ Container $container is outdated and needs to be recreated with the new image"
+                fi
+            else
+                echo "⚠️ Failed to check for updates to $image"
+            fi
+        done
+    ' > "$DOCKER_LOG" 2>&1
+    
+    # Try installing and running Trivy if we can
+    pct exec "$CTID" -- bash -c 'if ! command -v trivy >/dev/null 2>&1; then
+        echo "Trivy not installed. Attempting basic image checks only."
+    
+        # Check Docker image security best practices
+        for image in $(docker images --format "{{.Repository}}:{{.Tag}}" | grep -v "<none>"); do
+            echo "Image: $image"
+            docker inspect $image | grep -E "Labels|Env|Cmd|Entrypoint" | grep -v "Labels\":{}"
+        done
+    fi' >> "$DOCKER_LOG" 2>&1
+    
+    # Check for vulnerabilities
+    if grep -q "⚠️" "$DOCKER_LOG" 2>/dev/null; then
+        log_and_echo "⚠️ Docker security issues found in container $CTID ($CONTAINER_NAME)!" "warning"
+        grep -A1 "⚠️" "$DOCKER_LOG" 2>/dev/null | head -10 >> "$SUMMARY_LOG"
+    else
+        log_and_echo "No significant Docker issues found in container $CTID" "success"
+    fi
+}
+
+# Function to run all security checks
+run_security_checks() {
+    log_and_echo "Starting security checks..." "info"
+    
+    # Run Host Security Checks
+    run_clamav_on_host
+    run_rootkit_check_on_host
+    
+    # Get all running containers
+    CONTAINERS=$(pct list | grep running | awk '{print $1}')
+    
+    # Run Container Security Checks
+    for CTID in $CONTAINERS; do
+        CONTAINER_NAME=$(pct config "$CTID" | grep -oP 'name: \K.*' || echo "Container $CTID")
+        log_and_echo "Running security checks on container $CTID ($CONTAINER_NAME)..." "info"
+        
+        # Run security scans
+        run_clamav_in_container "$CTID" "$CONTAINER_NAME"
+        run_rootkit_check_in_container "$CTID" "$CONTAINER_NAME"
+        check_npm_vulnerabilities "$CTID" "$CONTAINER_NAME"
+        check_docker_security "$CTID" "$CONTAINER_NAME"
+    done
+}
+
+#------------------------------
+# BACKUP FUNCTIONS
+#------------------------------
+
+# Function to backup containers
+backup_containers() {
+    log_and_echo "Starting container backups..." "info"
+    
+    # Get all running containers
+    CONTAINERS=$(pct list | grep running | awk '{print $1}')
+    
+    BACKUP_ROOT="/mnt/backups/containers"
+    mkdir -p "$BACKUP_ROOT"
+    
+    for CTID in $CONTAINERS; do
+        CONTAINER_NAME=$(pct config "$CTID" | grep -oP 'name: \K.*' || echo "Container $CTID")
+        
+        log_and_echo "Backing up container $CTID ($CONTAINER_NAME)..." "info"
+        
+        # Create a backup of the container
+        BACKUP_FILE="${BACKUP_ROOT}/vzdump-lxc-${CTID}-${CURRENT_DATE}.tar.gz"
+        
+        if vzdump "$CTID" --compress lzo --dumpdir "$BACKUP_ROOT" --mode stop >> "$DETAILED_LOG" 2>&1; then
+            log_and_echo "Container $CTID backup completed successfully" "success"
+        else
+            log_and_echo "Container $CTID backup failed" "error"
+        fi
+    done
+}
+
+#------------------------------
+# NOTIFICATION FUNCTIONS
+#------------------------------
+
+# Function to send email notification
+send_email_notification() {
+    if [[ "$EMAIL_NOTIFY" == "true" && -n "$EMAIL" ]]; then
+        log_and_echo "Sending email notification to $EMAIL..." "info"
+        
+        # Prepare email content
+        HOSTNAME=$(hostname)
+        SUBJECT="Proxmox Maintenance Report - $HOSTNAME - $(date '+%Y-%m-%d')"
+        
+        # Email body
+        if [[ -f "$SUMMARY_LOG" ]]; then
+            cat "$SUMMARY_LOG" > /tmp/email_body.txt
+            
+            # Add a note if warnings were found
+            if grep -q "warning\|error" "$SUMMARY_LOG"; then
+                echo -e "\n⚠️ ATTENTION: Warnings or errors were detected during the maintenance run.\nPlease review the full logs at $LOG_DIR for details." >> /tmp/email_body.txt
+            else
+                echo -e "\nNo critical issues were detected during the maintenance run." >> /tmp/email_body.txt
+            fi
+            
+            # Add link to logs
+            echo -e "\nFull logs are available at: $LOG_DIR" >> /tmp/email_body.txt
+            
+            # Send the email
+            if command -v mail >/dev/null 2>&1; then
+                mail -s "$SUBJECT" "$EMAIL" < /tmp/email_body.txt >> "$DETAILED_LOG" 2>&1
+                
+                if [[ $? -eq 0 ]]; then
+                    log_and_echo "Email notification sent successfully to $EMAIL" "success"
+                else
+                    log_and_echo "Failed to send email notification" "error"
+                fi
+            else
+                log_and_echo "Mail command not found. Installing mailutils..." "info"
+                apt-get update && apt-get install -y mailutils >> "$DETAILED_LOG" 2>&1
+                
+                # Try to send again
+                mail -s "$SUBJECT" "$EMAIL" < /tmp/email_body.txt >> "$DETAILED_LOG" 2>&1
+                
+                if [[ $? -eq 0 ]]; then
+                    log_and_echo "Email notification sent successfully to $EMAIL" "success"
+                else
+                    log_and_echo "Failed to send email notification even after installing mailutils" "error"
+                fi
+            fi
+            
+            # Clean up
+            rm -f /tmp/email_body.txt
+        else
+            log_and_echo "Cannot find summary log file for email notification" "error"
+        fi
+    fi
+}
+
+# Function to send Discord notification
+send_discord_notification() {
+    if [[ "$DISCORD_NOTIFY" == "true" && -n "$DISCORD_WEBHOOK" ]]; then
+        log_and_echo "Sending Discord notification..." "info"
+        
+        # Prepare Discord message
+        HOSTNAME=$(hostname)
+        MESSAGE="**Proxmox Maintenance Report - $HOSTNAME - $(date '+%Y-%m-%d')**\n\n"
+        
+        # Create a summary of all security checks
+        MESSAGE+="**==== Security Scan Summary ====**\n"
+        
+        # Extract virus scan results
+        INFECTED_COUNT=0
+        CLAM_LOGS=$(ls -1 "${LOG_DIR}/clamscan_*_${CURRENT_DATE}.log" 2>/dev/null)
+        if [[ -n "$CLAM_LOGS" ]]; then
+            for CLAM_LOG in $CLAM_LOGS; do
+                INFECTED=$(grep -a "Infected files" "$CLAM_LOG" 2>/dev/null | awk '{print $3}' | tr -d ':')
+                if [[ -n "$INFECTED" && "$INFECTED" -gt 0 ]]; then
+                    INFECTED_COUNT=$((INFECTED_COUNT + INFECTED))
+                    SCAN_TYPE=$(basename "$CLAM_LOG" | cut -d'_' -f2)
+                    MESSAGE+=":biohazard: Found $INFECTED infected files in $SCAN_TYPE\n"
+                fi
+            done
+        fi
+        
+        if [[ "$INFECTED_COUNT" -eq 0 ]]; then
+            MESSAGE+=":white_check_mark: No virus infections detected\n"
+        fi
+        
+        # Extract rootkit scan results
+        RKH_WARNING_COUNT=0
+        RKH_LOGS=$(ls -1 "${LOG_DIR}/rkhunter_*_${CURRENT_DATE}.log" 2>/dev/null)
+        if [[ -n "$RKH_LOGS" ]]; then
+            for RKH_LOG in $RKH_LOGS; do
+                WARNINGS=$(grep -c "Warning:" "$RKH_LOG" 2>/dev/null || echo "0")
+                if [[ "$WARNINGS" -gt 0 ]]; then
+                    RKH_WARNING_COUNT=$((RKH_WARNING_COUNT + WARNINGS))
+                    SCAN_TYPE=$(basename "$RKH_LOG" | cut -d'_' -f2)
+                    MESSAGE+=":warning: Found $WARNINGS rootkit warnings in $SCAN_TYPE\n"
+                fi
+            done
+        fi
+        
+        if [[ "$RKH_WARNING_COUNT" -eq 0 ]]; then
+            MESSAGE+=":white_check_mark: No rootkit warnings detected\n"
+        fi
+        
+        # Extract NPM audit results
+        NPM_VULN_COUNT=0
+        NPM_LOGS=$(ls -1 "${LOG_DIR}/npm_audit_*_${CURRENT_DATE}.log" 2>/dev/null)
+        if [[ -n "$NPM_LOGS" ]]; then
+            for NPM_LOG in $NPM_LOGS; do
+                if grep -q "vulnerabilities" "$NPM_LOG" 2>/dev/null; then
+                    SCAN_TYPE=$(basename "$NPM_LOG" | cut -d'_' -f3)
+                    VULN_LINE=$(grep "vulnerabilities" "$NPM_LOG" 2>/dev/null | head -1)
+                    MESSAGE+=":warning: NPM issues in $SCAN_TYPE: $VULN_LINE\n"
+                    NPM_VULN_COUNT=$((NPM_VULN_COUNT + 1))
+                fi
+            done
+        fi
+        
+        if [[ "$NPM_VULN_COUNT" -eq 0 && -n "$NPM_LOGS" ]]; then
+            MESSAGE+=":white_check_mark: No NPM vulnerabilities detected\n"
+        fi
+        
+        # Extract Docker security results
+        DOCKER_WARN_COUNT=0
+        DOCKER_LOGS=$(ls -1 "${LOG_DIR}/docker_security_*_${CURRENT_DATE}.log" 2>/dev/null)
+        if [[ -n "$DOCKER_LOGS" ]]; then
+            for DOCKER_LOG in $DOCKER_LOGS; do
+                if grep -q "⚠️" "$DOCKER_LOG" 2>/dev/null; then
+                    SCAN_TYPE=$(basename "$DOCKER_LOG" | cut -d'_' -f3)
+                    WARNINGS=$(grep -c "⚠️" "$DOCKER_LOG" 2>/dev/null || echo "0")
+                    MESSAGE+=":warning: Docker issues in $SCAN_TYPE: $WARNINGS container/image problems\n"
+                    DOCKER_WARN_COUNT=$((DOCKER_WARN_COUNT + WARNINGS))
+                fi
+            done
+        fi
+        
+        if [[ "$DOCKER_WARN_COUNT" -eq 0 && -n "$DOCKER_LOGS" ]]; then
+            MESSAGE+=":white_check_mark: No Docker security issues detected\n"
+        fi
+        
+        # System update summary
+        MESSAGE+="\n**==== System Update Summary ====**\n"
+        if grep -q "System upgrade completed successfully" "$DETAILED_LOG"; then
+            MESSAGE+=":white_check_mark: Host system updated successfully\n"
+            
+            # Check if reboot is needed
+            if grep -q "System requires a reboot" "$DETAILED_LOG"; then
+                MESSAGE+=":warning: **System requires a reboot after updates**\n"
+            fi
+        elif grep -q "Error during system upgrade" "$DETAILED_LOG"; then
+            MESSAGE+=":x: Host system update failed\n"
+        elif ! grep -q "Starting system upgrade" "$DETAILED_LOG"; then
+            MESSAGE+=":information_source: System updates were not performed in this run\n"
+        fi
+        
+        # Overall status indication
+        MESSAGE+="\n**==== Overall Status ====**\n"
+        if grep -q "error\|warning\|⚠️" "$SUMMARY_LOG"; then
+            MESSAGE+=":warning: **Warnings or errors were detected**\n"
+            MESSAGE+="Please check the full logs at $LOG_DIR for details\n"
+            
+            # Discord message part 2 (limited by character count)
+            MESSAGE2="**Issues Found:**\n"
+            grep -i "error\|warning\|⚠️" "$SUMMARY_LOG" | head -10 | while read -r line; do
+                MESSAGE2+="- $line\n"
+            done
+            
+            # Prepare JSON payload for part 1
+            local JSON_DATA="{
+                \"content\": \"$MESSAGE\"
+            }"
+            
+            # Send first part
+            curl -s -H "Content-Type: application/json" -d "$JSON_DATA" "$DISCORD_WEBHOOK" > /dev/null
+            
+            # Prepare JSON payload for part 2
+            local JSON_DATA2="{
+                \"content\": \"$MESSAGE2\"
+            }"
+            
+            # Send second part
+            curl -s -H "Content-Type: application/json" -d "$JSON_DATA2" "$DISCORD_WEBHOOK" > /dev/null
+        else
+            MESSAGE+=":white_check_mark: **No critical issues detected**\n"
+            
+            # Prepare JSON payload
+            local JSON_DATA="{
+                \"content\": \"$MESSAGE\"
+            }"
+            
+            # Send webhook
+            curl -s -H "Content-Type: application/json" -d "$JSON_DATA" "$DISCORD_WEBHOOK" > /dev/null
+        fi
+        
+        log_and_echo "Discord notification sent successfully" "success"
+    fi
+}
+
+# Function to display final summary
+display_summary() {
+    echo -e "${BLUE}"
+    echo "==============================================================="
+    echo "  PVESecure Maintenance Report Summary"
+    echo "==============================================================="
+    echo -e "${NC}"
+    
+    # Count warnings and errors
+    WARNING_COUNT=$(grep -c "warning\|⚠️" "$SUMMARY_LOG" 2>/dev/null || echo "0")
+    ERROR_COUNT=$(grep -c "error\|❌" "$SUMMARY_LOG" 2>/dev/null || echo "0")
+    
+    echo -e "${BLUE}Status Summary:${NC}"
+    echo -e "  ${YELLOW}Warnings: $WARNING_COUNT${NC}"
+    echo -e "  ${RED}Errors: $ERROR_COUNT${NC}"
+    echo
+    
+    if [[ "$WARNING_COUNT" -gt 0 || "$ERROR_COUNT" -gt 0 ]]; then
+        echo -e "${YELLOW}Top issues found:${NC}"
+        grep -i "warning\|error\|⚠️\|❌" "$SUMMARY_LOG" 2>/dev/null | head -5 | while read -r line; do
+            echo -e "  - $line"
+        done
+        echo
+        echo -e "${YELLOW}Please check the detailed logs at $LOG_DIR for more information.${NC}"
+    else
+        echo -e "${GREEN}No critical issues detected in this maintenance run.${NC}"
+    fi
+    
+    echo
+    echo -e "${GREEN}Maintenance complete! Full logs saved to $LOG_DIR${NC}"
+    echo -e "${BLUE}===============================================================${NC}"
+    echo -e "${GREEN}Thank you for using PVESecure!${NC}"
+    echo -e "${GREEN}Please consider subscribing to ConnectedSecure on YouTube${NC}"
+    echo -e "${GREEN}YouTube: ${NC}https://www.youtube.com/channel/UCSNleiwJs4VC-VYuRJ0nnjg"
+    echo -e "${GREEN}X/Twitter: ${NC}@SecureCnnected"
+    echo -e "${BLUE}===============================================================${NC}"
+}
+
+# Main function
+main() {
+    # Load existing config if available
+    load_config
+    
+    # Display interactive menu
+    display_interactive_menu
+    
+    # Initialize the script
+    initialize
+    
+    # Run chosen operations
+    if [[ "$DO_UPDATE" == "true" ]]; then
+        update_host
+        update_containers
+    fi
+    
+    if [[ "$DO_SECURITY" == "true" ]]; then
+        run_security_checks
+    fi
+    
+    if [[ "$DO_BACKUP" == "true" ]]; then
+        backup_containers
+    fi
+    
+    # Send notifications
+    if [[ "$EMAIL_NOTIFY" == "true" ]]; then
+        send_email_notification
+    fi
+    
+    if [[ "$DISCORD_NOTIFY" == "true" ]]; then
+        send_discord_notification
+    fi
+    
+    # Display final summary
+    display_summary
+}
+
+# Run main function
+main
+
