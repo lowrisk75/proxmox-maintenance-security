@@ -8,9 +8,9 @@
 #  - Security audits (ClamAV, Rootkit, NPM, Docker)             #
 #  - Discord notifications                                      #
 #                                                               #
-#  Created by: Kevin Nadjarian - ConnectedSecure                #
-#  YouTube: www.youtube.com/@connectedsecure                    #
-#  X/Twitter: @SecureConnected                                   #
+#  Created by: ConnectedSecure                                  #
+#  YouTube: https://www.youtube.com/channel/UCSNleiwJs4VC-VYuRJ0nnjg  #
+#  X/Twitter: @SecureCnnected                                   #
 #                                                               #
 #  Version: 2.1                                                 #
 #                                                               #
@@ -58,10 +58,16 @@ echo "=== Detailed Log - $(date) ===" > "$DETAILED_LOG"
 check_for_updates() {
     log_and_echo "Checking for script updates..." "info"
     
-    # Get latest version from GitHub
+    # First try to get latest version from GitHub
     local LATEST_VERSION=$(curl -s https://raw.githubusercontent.com/lowrisk75/proxmox-maintenance-security/main/version.txt 2>/dev/null)
     
-    if [[ -n "$LATEST_VERSION" && "$LATEST_VERSION" != "$SCRIPT_VERSION" ]]; then
+    # Check if we got a valid version number (should only contain digits and dots)
+    if [[ ! "$LATEST_VERSION" =~ ^[0-9.]+$ ]]; then
+        log_and_echo "Could not retrieve version information from GitHub" "warning"
+        return
+    fi
+    
+    if [[ "$LATEST_VERSION" != "$SCRIPT_VERSION" ]]; then
         log_and_echo "New version available: $LATEST_VERSION (Current: $SCRIPT_VERSION)" "warning"
         log_and_echo "Get the latest version at: https://github.com/lowrisk75/proxmox-maintenance-security" "info"
         echo ""
@@ -383,13 +389,15 @@ run_clamav_on_host() {
     log_and_echo "Starting ClamAV scan on host..." "info"
     CLAM_LOG="${LOG_DIR}/clamscan_host_${CURRENT_DATE}.log"
     
-    clamscan --recursive --infected /home /etc /var /root > "$CLAM_LOG" 2>&1
+    # FIXED: Added resource limits to prevent the clamscan from being killed
+    clamscan --max-filesize=100M --max-scansize=400M --recursive --infected /home /etc /var /root > "$CLAM_LOG" 2>&1
     
     # Parse results for reporting
     INFECTED=$(grep "Infected files" "$CLAM_LOG" 2>/dev/null | awk '{print $3}')
     SCANNED=$(grep "Scanned files" "$CLAM_LOG" 2>/dev/null | awk '{print $3}')
     
-    if [[ -n "$INFECTED" && "$INFECTED" -gt 0 ]]; then
+    # FIXED: Changed the if statement syntax
+    if [ -n "$INFECTED" ] && [ "$INFECTED" -gt 0 ]; then
         log_and_echo "⚠️ ALERT: Found $INFECTED infected files out of $SCANNED scanned files on host!" "error"
         grep -A2 FOUND "$CLAM_LOG" >> "$SUMMARY_LOG" 2>/dev/null
     else
@@ -441,10 +449,11 @@ run_clamav_in_container() {
         pct exec "$CTID" -- bash -c 'freshclam' >> "$DETAILED_LOG" 2>&1 || log_and_echo "Warning: Could not update virus definitions in container $CTID" "warning"
     fi
     
-    # Run scan on important directories in container
+    # Run scan on important directories in container with resource limits
     log_and_echo "Starting ClamAV scan in container $CTID..." "info"
     
-    pct exec "$CTID" -- bash -c "clamscan --recursive --infected /home /etc /var/www 2>&1" > "$CLAM_LOG"
+    # Added resource limits to prevent the clamscan from being killed
+    pct exec "$CTID" -- bash -c "clamscan --max-filesize=50M --max-scansize=100M --recursive --infected /home /etc /var/www 2>&1" > "$CLAM_LOG"
     
     # Parse results
     INFECTED=$(grep -a "Infected files" "$CLAM_LOG" 2>/dev/null | awk '{print $3}' | tr -d ':')
@@ -454,7 +463,7 @@ run_clamav_in_container() {
     echo "Files scanned: ${SCANNED:-Unknown}" >> "$DETAILED_LOG"
     echo "Infected files: ${INFECTED:-Unknown}" >> "$DETAILED_LOG"
     
-    if [[ -n "$INFECTED" && "$INFECTED" -gt 0 ]]; then
+    if [ -n "$INFECTED" ] && [ "$INFECTED" -gt 0 ]; then
         log_and_echo "⚠️ ALERT: Found $INFECTED infected files in container $CTID ($CONTAINER_NAME)!" "error"
         grep -A2 FOUND "$CLAM_LOG" >> "$SUMMARY_LOG" 2>/dev/null
     else
@@ -466,30 +475,31 @@ run_clamav_in_container() {
 run_rootkit_check_on_host() {
     log_and_echo "Checking for rootkits on host..." "info"
     
-    # Install rkhunter if not present
+    # Verify rkhunter is installed
     if ! command -v rkhunter >/dev/null 2>&1; then
-        log_and_echo "Installing rkhunter on host..." "info"
+        log_and_echo "Installing rkhunter..." "info"
         apt-get update && apt-get install -y rkhunter >> "$DETAILED_LOG" 2>&1
     fi
     
-    # Update rkhunter databases
-    log_and_echo "Updating rkhunter databases..." "info"
-    rkhunter --update >> "$DETAILED_LOG" 2>&1
-    
-    # Run the scan
-    log_and_echo "Running rootkit scan..." "info"
+    # Create rootkit scan log file
     RKH_LOG="${LOG_DIR}/rkhunter_host_${CURRENT_DATE}.log"
     
-    rkhunter --check --sk > "$RKH_LOG" 2>&1
+    # Update rkhunter database and run check
+    log_and_echo "Updating rkhunter database..." "info"
+    rkhunter --update >> "$DETAILED_LOG" 2>&1
+    
+    log_and_echo "Running rootkit scan on host..." "info"
+    rkhunter --check --sk >> "$RKH_LOG" 2>&1
     
     # Check for warnings
     WARNING_COUNT=$(grep -c "Warning:" "$RKH_LOG" 2>/dev/null || echo "0")
     
-    if [[ "$WARNING_COUNT" -gt 0 ]]; then
-        log_and_echo "⚠️ $WARNING_COUNT warnings found in rootkit scan!" "warning"
+    # Fixed line - replaced the broken conditional with proper syntax
+    if [ "$WARNING_COUNT" -gt 0 ]; then
+        log_and_echo "⚠️ $WARNING_COUNT warnings found in host rootkit scan!" "warning"
         grep "Warning:" "$RKH_LOG" >> "$SUMMARY_LOG" 2>/dev/null
     else
-        log_and_echo "Rootkit scan completed - No warnings found" "success"
+        log_and_echo "Host rootkit scan completed - No warnings found" "success"
     fi
     
     log_and_echo "Full rootkit scan log available at: $RKH_LOG" "info"
@@ -536,7 +546,8 @@ run_rootkit_check_in_container() {
     # Check for warnings
     WARNING_COUNT=$(grep -c "Warning:" "$RKH_LOG" 2>/dev/null || echo "0")
     
-    if [[ "$WARNING_COUNT" -gt 0 ]]; then
+    # Fixed comparison - this is the key fix
+    if [ "$WARNING_COUNT" -gt 0 ]; then
         log_and_echo "⚠️ $WARNING_COUNT warnings found in container $CTID rootkit scan!" "warning"
         grep "Warning:" "$RKH_LOG" >> "$SUMMARY_LOG" 2>/dev/null
     else
@@ -942,7 +953,8 @@ display_summary() {
     echo -e "  ${RED}Errors: $ERROR_COUNT${NC}"
     echo
     
-    if [[ "$WARNING_COUNT" -gt 0 || "$ERROR_COUNT" -gt 0 ]]; then
+    # FIXED: Changed the if statement syntax
+    if [ "$WARNING_COUNT" -gt 0 ] || [ "$ERROR_COUNT" -gt 0 ]; then
         echo -e "${YELLOW}Top issues found:${NC}"
         grep -i "warning\|error\|⚠️\|❌" "$SUMMARY_LOG" 2>/dev/null | head -5 | while read -r line; do
             echo -e "  - $line"
@@ -958,8 +970,8 @@ display_summary() {
     echo -e "${BLUE}===============================================================${NC}"
     echo -e "${GREEN}Thank you for using PVESecure!${NC}"
     echo -e "${GREEN}Please consider subscribing to ConnectedSecure on YouTube${NC}"
-    echo -e "${GREEN}YouTube: ${NC}https://www.youtube.com/channel/UCSNleiwJs4VC-VYuRJ0nnjg"
-    echo -e "${GREEN}X/Twitter: ${NC}@SecureCnnected"
+    echo -e "${GREEN}YouTube: ${NC}www.youtube.com/@connectedsecure"
+    echo -e "${GREEN}X/Twitter: ${NC}@SecureConnected"
     echo -e "${BLUE}===============================================================${NC}"
 }
 
@@ -1003,4 +1015,3 @@ main() {
 
 # Run main function
 main
-
